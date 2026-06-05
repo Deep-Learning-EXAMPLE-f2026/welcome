@@ -1,0 +1,50 @@
+name: Onboard student
+
+# Fires when a student opens a "Join the course" issue.
+# The issue AUTHOR is the authenticated GitHub handle — captured by construction,
+# unspoofable on the half that matters for provisioning (ADR 0010 §3).
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  onboard:
+    if: startsWith(github.event.issue.title, 'Join')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Welcome + capture handle
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const handle = context.payload.issue.user.login;   // authenticated identity
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: [
+                `Welcome **@${handle}** 👋`,
+                ``,
+                `Your handle is captured (verified as the issue author).`,
+                `Next (production): an Action matches your student ID against the **private**`,
+                `registrar-seeded roster, invites you to the cohort org, and provisions your`,
+                `assignment repos via the bot-push provisioner.`,
+                ``,
+                `_Demo: no real invite is sent and no PII is read from this public issue._`,
+              ].join('\n')
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number, labels: ['onboarding']
+            });
+
+      # ── Production steps (intentionally not wired in the demo) ─────────────────
+      # Requires a GitHub App / fine-grained token (secrets.CLASSROOM_TOKEN) with
+      # access to the private config repo + org membership admin. See ADR 0010.
+      #
+      #  1. Parse student_id from the issue form body.
+      #  2. Match against students.csv in the PRIVATE config repo (reject non-enrolees).
+      #  3. Set github_handle on that roster row, keyed on the immutable GitHub user ID.
+      #  4. Invite @handle to the cohort org; run the provisioner for their repos.
