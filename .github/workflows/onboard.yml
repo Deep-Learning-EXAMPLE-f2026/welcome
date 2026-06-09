@@ -1,12 +1,29 @@
 name: Onboard student
 
-# Fires when a student opens a "Join the course" issue.
-# The issue AUTHOR is the authenticated GitHub handle — captured by construction,
-# unspoofable on the half that matters for provisioning (ADR 0010 §3).
+# Student-facing enrolment (ADR 0010 §3). The ONLY Action that lives cohort-side —
+# students open a "Join" issue HERE (public welcome repo), so the trigger is
+# inherently cohort-local. Everything faculty-facing lives in the master course-ops
+# console instead.
+#
+# Flow: the issue AUTHOR is the authenticated GitHub handle (unspoofable). We match
+# the student-typed student_id against the PRIVATE registrar-seeded roster, reject
+# non-enrolees, write the authenticated handle + immutable id back onto that row,
+# then grant org + students-team access. Distribution of assignment repos is a
+# SEPARATE faculty step (course-ops → Provision assignment) — enrol once, provision
+# per assignment.
+#
+# Token: runs under the bot PAT (secrets.DSL_BOT_TOKEN), which needs — on THIS cohort
+# org — Contents R/W on classroom-config, Members R/W (org invite + team), and Issues
+# R/W on welcome. Production target is a GitHub App (ADR 0010 "Tokens").
 
 on:
   issues:
     types: [opened]
+
+# Serialise against append races on students.csv (ADR 0010 §3 caveat).
+concurrency:
+  group: onboard-roster
+  cancel-in-progress: false
 
 permissions:
   issues: write
@@ -16,35 +33,90 @@ jobs:
     if: startsWith(github.event.issue.title, 'Join')
     runs-on: ubuntu-latest
     steps:
-      - name: Welcome + capture handle
+      - name: Match roster, capture handle, grant access
         uses: actions/github-script@v7
         with:
+          # Bot PAT for cross-repo private read/write + org admin. Falls back to the
+          # default token (which CANNOT read classroom-config or invite) so the demo
+          # fails loud with a clear message until the secret is set.
+          github-token: ${{ secrets.DSL_BOT_TOKEN || github.token }}
           script: |
-            const handle = context.payload.issue.user.login;   // authenticated identity
-            await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.payload.issue.number,
-              body: [
-                `Welcome **@${handle}** 👋`,
-                ``,
-                `Your handle is captured (verified as the issue author).`,
-                `Next (production): an Action matches your student ID against the **private**`,
-                `registrar-seeded roster, invites you to the cohort org, and provisions your`,
-                `assignment repos via the bot-push provisioner.`,
-                ``,
-                `_Demo: no real invite is sent and no PII is read from this public issue._`,
-              ].join('\n')
-            });
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.payload.issue.number, labels: ['onboarding']
-            });
+            const org    = context.repo.owner;            // the cohort org
+            const issue  = context.payload.issue;
+            const handle = issue.user.login;              // authenticated identity
+            const userId = issue.user.id;                 // immutable — key on this
+            const CONFIG = 'classroom-config', FILE = 'students.csv';
 
-      # ── Production steps (intentionally not wired in the demo) ─────────────────
-      # Requires a GitHub App / fine-grained token (secrets.CLASSROOM_TOKEN) with
-      # access to the private config repo + org membership admin. See ADR 0010.
-      #
-      #  1. Parse student_id from the issue form body.
-      #  2. Match against students.csv in the PRIVATE config repo (reject non-enrolees).
-      #  3. Set github_handle on that roster row, keyed on the immutable GitHub user ID.
-      #  4. Invite @handle to the cohort org; run the provisioner for their repos.
+            const fail = async (msg, label) => {
+              await github.rest.issues.createComment({
+                owner: org, repo: context.repo.repo, issue_number: issue.number, body: msg });
+              await github.rest.issues.addLabels({
+                owner: org, repo: context.repo.repo, issue_number: issue.number, labels: [label] });
+              core.setFailed(msg.replace(/\*\*/g, ''));
+            };
+
+            // Did the secret get set? If not, the bot calls below would 404/403 confusingly.
+            if (!process.env.HAS_BOT) {
+              return fail(
+                `Thanks @${handle} — enrolment is **not yet armed**: the \`DSL_BOT_TOKEN\` secret is unset, ` +
+                `so I can't read the private roster or invite you. A maintainer will action this.`,
+                'needs-review');
+            }
+
+            // 1. Parse the student_id the issue form collected.
+            const m = (issue.body || '').match(/Student ID\s*[\r\n]+\s*([0-9]{3,})/i);
+            const studentId = m && m[1];
+            if (!studentId) return fail(
+              `Thanks @${handle} — I couldn't read a **Student ID** from the form. Please edit the issue and add it.`,
+              'needs-review');
+
+            // 2. Read the PRIVATE roster.
+            const got = await github.rest.repos.getContent({ owner: org, repo: CONFIG, path: FILE });
+            const sha = got.data.sha;
+            const lines = Buffer.from(got.data.content, 'base64').toString('utf8').replace(/\n$/, '').split('\n');
+            const header = lines[0];
+            const rows = lines.slice(1).map(l => l.split(','));   // [student_id,email,name,handle,id,section]
+
+            // 3. Match the authenticated handle to a registrar-seeded row — reject non-enrolees.
+            const row = rows.find(r => r[0] === studentId);
+            if (!row) return fail(
+              `Thanks @${handle} — student ID **${studentId}** isn't on the enrolment roster. ` +
+              `If you believe you're enrolled, contact the teaching team.`,
+              'needs-review');
+            if (row[3] && row[3] !== handle) return fail(
+              `Student ID **${studentId}** is already linked to a different GitHub account. ` +
+              `Contact the teaching team to resolve this.`,
+              'needs-review');
+
+            // 4. Write the authenticated handle + immutable id back (idempotent).
+            const already = row[3] === handle;
+            row[3] = handle; row[4] = String(userId);
+            if (!already) {
+              const body = [header, ...rows.map(r => r.join(','))].join('\n') + '\n';
+              await github.rest.repos.createOrUpdateFileContents({
+                owner: org, repo: CONFIG, path: FILE, sha,
+                message: `roster: link ${studentId} -> @${handle} (id ${userId})`,
+                content: Buffer.from(body, 'utf8').toString('base64'),
+              });
+            }
+
+            // 5. Grant access: org membership (invites if needed) + students team.
+            await github.rest.orgs.setMembershipForUser({ org, username: handle, role: 'member' });
+            await github.rest.teams.addOrUpdateMembershipForUserInOrg({
+              org, team_slug: 'students', username: handle, role: 'member' });
+
+            // 6. Confirm.
+            await github.rest.issues.createComment({
+              owner: org, repo: context.repo.repo, issue_number: issue.number, body: [
+                `Welcome **@${handle}** 👋 — you're **enrolled**.`,
+                ``,
+                `- Matched to the roster (student ID ${studentId}); your handle + GitHub id are recorded.`,
+                `- You've been added to the **${org}** org and the **students** team (this unlocks released materials).`,
+                `- Your assignment repos appear here once the teaching team provisions each assignment.`,
+              ].join('\n') });
+            await github.rest.issues.addLabels({
+              owner: org, repo: context.repo.repo, issue_number: issue.number, labels: ['enrolled'] });
+            await github.rest.issues.update({
+              owner: org, repo: context.repo.repo, issue_number: issue.number, state: 'closed' });
+        env:
+          HAS_BOT: ${{ secrets.DSL_BOT_TOKEN != '' || '' }}
